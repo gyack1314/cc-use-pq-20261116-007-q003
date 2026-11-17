@@ -75,6 +75,46 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(result["duplicate_count"], 1)
         self.assertTrue(result["verified"])
 
+    def test_cli_transfer_demo_and_evidence_commands(self):
+        code, result, error = self.invoke("demo-transfer", "--workspace", str(self.root / "transfer"))
+        self.assertEqual(code, 0)
+        self.assertEqual(error, "")
+        self.assertFalse(result["feasible"])
+        self.assertEqual(result["selection"], [])
+        self.assertEqual(result["candidate_selection"], ["portable_transfer"])
+        self.assertEqual(result["candidate_cost"], "60.00")
+        self.assertEqual(result["verified_credited"], 0)
+        self.assertEqual(result["candidate_credited_with_pending"], 2)
+        self.assertEqual({item["status"] for item in result["evidence"]},
+                         {"validated", "pending"})
+        db = str(self.root / "transfer" / "portfolio.sqlite3")
+        code, stale, _ = self.invoke_for(db, "stale-drafts")
+        self.assertEqual(code, 0)
+        self.assertEqual(stale, [])
+        code, versions, _ = self.invoke_for(db, "versions", "evidence", "transfer_grasp_v1")
+        self.assertEqual(code, 0)
+        self.assertEqual(versions[0]["revision"], 1)
+
+    def test_cli_imports_evidence_from_file(self):
+        evidence = {"key": "transfer_place_v2", "package": "portable_transfer",
+                    "source_robot": "arm_b", "target_robot": "arm_a",
+                    "scopes": [{"scenario": "warehouse_pick", "stage": "place",
+                                "outcome": "failure"}],
+                    "status": "validated"}
+        path = self.root / "evidence.json"
+        path.write_text(json.dumps(evidence), encoding="utf-8")
+        code, imported, error = self.invoke("import", "evidence", str(path))
+        self.assertEqual(code, 0)
+        self.assertEqual(error, "")
+        self.assertEqual(imported["key"], "transfer_place_v2")
+        self.assertEqual(self.invoke("status")[1]["evidence_count"], 1)
+
+    def invoke_for(self, db, *args):
+        stdout, stderr = StringIO(), StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = main(["--db", db, *args])
+        return code, json.loads(stdout.getvalue()) if stdout.getvalue() else None, stderr.getvalue()
+
 
 if __name__ == "__main__":
     unittest.main()

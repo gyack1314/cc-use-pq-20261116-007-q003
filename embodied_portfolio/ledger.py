@@ -123,7 +123,7 @@ class Ledger:
         identities = [(kind, key) for kind, key, _ in entries]
         if len(set(identities)) != len(identities):
             raise PortfolioError("duplicate_batch_key", "batch repeats a document key")
-        if any(kind not in {"offer", "requirement"} for kind, _, _ in entries):
+        if any(kind not in {"offer", "requirement", "evidence"} for kind, _, _ in entries):
             raise PortfolioError("document_kind", "batch contains unknown document kind")
         results = []
         with self.transaction():
@@ -158,8 +158,11 @@ class Ledger:
         return [{**dict(row), "report": json.loads(row["report"])} for row in rows]
 
     def insert_analysis(self, requirement: dict[str, Any], offer_docs: list[dict[str, Any]],
-                        report: dict[str, Any]) -> dict[str, Any]:
-        input_refs = [(item["id"], item["digest"]) for item in [requirement, *offer_docs]]
+                        report: dict[str, Any],
+                        evidence_docs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        evidence_docs = evidence_docs or []
+        input_refs = [(item["id"], item["digest"])
+                      for item in [requirement, *offer_docs, *evidence_docs]]
         input_hash = digest(input_refs)
         report_hash = digest(report)
         with self.transaction():
@@ -170,20 +173,27 @@ class Ledger:
             self.db.executemany("INSERT INTO analysis_inputs VALUES(?,?)",
                                 [(analysis_id, doc_id) for doc_id, _ in input_refs])
             self.event("analyze", f"analysis:{analysis_id}", {"input_digest": input_hash,
-                       "report_digest": report_hash})
+                       "report_digest": report_hash,
+                       "evidence_keys": [doc["key"] for doc in evidence_docs]})
             return self.analysis(analysis_id)
 
     def analysis_inputs(self, analysis_id: int) -> list[dict[str, Any]]:
         rows = self.db.execute("SELECT d.* FROM documents d JOIN analysis_inputs a ON a.document_id=d.id "
-                               "WHERE a.analysis_id=? ORDER BY CASE d.kind WHEN 'requirement' THEN 0 ELSE 1 END,d.key", (analysis_id,))
+                               "WHERE a.analysis_id=? ORDER BY CASE d.kind WHEN 'requirement' THEN 0 "
+                               "WHEN 'offer' THEN 1 ELSE 2 END,d.key", (analysis_id,))
         return [self._document(row) for row in rows]
+
+    def latest_evidence(self) -> list[dict[str, Any]]:
+        return self.documents("evidence")
 
     def latest_input_digest(self, requirement_key: str) -> str:
         requirement = self.latest_document("requirement", requirement_key)
         if not requirement:
             raise PortfolioError("missing_requirement", "requirement not found")
         offers = self.documents("offer")
-        return digest([(doc["id"], doc["digest"]) for doc in [requirement, *offers]])
+        policy = requirement["body"].get("transfer_policy", "exact")
+        evidence = self.latest_evidence() if policy != "exact" else []
+        return digest([(doc["id"], doc["digest"]) for doc in [requirement, *offers, *evidence]])
 
     def approve(self, analysis_id: int, expected_input_digest: str) -> dict[str, Any]:
         with self.transaction():

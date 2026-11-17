@@ -15,7 +15,7 @@ def parser() -> ArgumentParser:
     main.add_argument("--db", default="portfolio.sqlite3", help="本地SQLite文件")
     commands = main.add_subparsers(dest="command", required=True)
     incoming = commands.add_parser("import")
-    incoming.add_argument("kind", choices=("offer", "requirement"))
+    incoming.add_argument("kind", choices=("offer", "requirement", "evidence"))
     incoming.add_argument("file")
     batch = commands.add_parser("batch")
     batch.add_argument("file")
@@ -30,11 +30,15 @@ def parser() -> ArgumentParser:
     verify.add_argument("id", type=int)
     history = commands.add_parser("history")
     history.add_argument("--requirement")
+    stale = commands.add_parser("stale-drafts")
+    stale.add_argument("--requirement")
+    replan = commands.add_parser("replan")
+    replan.add_argument("analysis", type=int)
     documents = commands.add_parser("versions")
-    documents.add_argument("kind", choices=("offer", "requirement"))
+    documents.add_argument("kind", choices=("offer", "requirement", "evidence"))
     documents.add_argument("key")
     revisions = commands.add_parser("compare-versions")
-    revisions.add_argument("kind", choices=("offer", "requirement"))
+    revisions.add_argument("kind", choices=("offer", "requirement", "evidence"))
     revisions.add_argument("key")
     revisions.add_argument("earlier", type=int)
     revisions.add_argument("later", type=int)
@@ -61,6 +65,9 @@ def parser() -> ArgumentParser:
     withdrawal = commands.add_parser("withdrawal")
     withdrawal.add_argument("requirement")
     withdrawal.add_argument("package")
+    evidence_withdrawal = commands.add_parser("evidence-withdrawal")
+    evidence_withdrawal.add_argument("requirement")
+    evidence_withdrawal.add_argument("evidence")
     price = commands.add_parser("price-scenario")
     price.add_argument("requirement")
     price.add_argument("package")
@@ -78,6 +85,8 @@ def parser() -> ArgumentParser:
     commands.add_parser("status")
     demo = commands.add_parser("demo")
     demo.add_argument("--workspace", default="fixtures")
+    transfer_demo = commands.add_parser("demo-transfer")
+    transfer_demo.add_argument("--workspace", default="fixtures_transfer")
     return main
 
 
@@ -99,6 +108,77 @@ def demo_payloads() -> tuple[dict[str, Any], list[dict[str, Any]]]:
               "license": "single_customer", "allowed_clients": ["client_a"],
               "validity": "2026", "notes": "合成数据"}
     return requirement, [first, second]
+
+
+def transfer_demo_payloads() -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    """合成演示：便携采集的 arm_b 失败样本，仅抓取阶段有已验证迁移记录。"""
+    target = {"scenario": "warehouse_pick", "stage": "grasp", "outcome": "failure", "robot": "arm_a"}
+    pending_target = {**target, "stage": "place"}
+    requirement = {"key": "transfer_trial", "client": "client_a",
+                   "title": "便携失败样本迁移采购（合成）", "budget": "220",
+                   "targets": [{"slice": target, "minimum": 4, "mandatory": True, "weight": "2"},
+                               {"slice": pending_target, "minimum": 2, "mandatory": True,
+                                "weight": "1"}],
+                   "allowed_paths": ["teleoperation", "portable"], "maximum_packages": 2,
+                   "transfer_policy": "validated"}
+    direct = {"provider": "provider_a", "package": "teleop_direct", "path": "teleoperation",
+              "robots": ["arm_a"], "observations": [{"slice": target, "count": 2,
+                                                   "episode_ids": ["a_01", "a_02"]}],
+              "hours": "1", "price_mode": "per_hour", "unit_price": "60",
+              "license": "nonexclusive", "allowed_clients": [], "validity": "2026",
+              "notes": "合成数据"}
+    portable_target = {**target, "robot": "arm_b"}
+    portable = {"provider": "provider_b", "package": "portable_transfer", "path": "portable",
+                "robots": ["arm_b"],
+                "observations": [{"slice": portable_target,
+                                  "count": 4, "episode_ids": ["b_01", "b_02", "b_03", "b_04"]},
+                                 {"slice": {**portable_target, "stage": "place"},
+                                  "count": 2, "episode_ids": ["b_10", "b_11"]}],
+                "hours": "0", "price_mode": "flat", "unit_price": "60",
+                "license": "nonexclusive", "allowed_clients": [], "validity": "2026",
+                "notes": "便携设备采集"}
+    evidence = [
+        {"key": "transfer_grasp_v1", "package": "portable_transfer",
+         "source_robot": "arm_b", "target_robot": "arm_a",
+         "scopes": [{"scenario": "warehouse_pick", "stage": "grasp", "outcome": "failure"}],
+         "status": "validated", "reference": "bench-report-2026-01", "validity": "2026",
+         "notes": "已验证抓取阶段迁移"},
+        {"key": "transfer_place_v1", "package": "portable_transfer",
+         "source_robot": "arm_b", "target_robot": "arm_a",
+         "scopes": [{"scenario": "warehouse_pick", "stage": "place", "outcome": "failure"}],
+         "status": "pending", "reference": "supplier-claim", "validity": "2026",
+         "notes": "供应商声称可迁移，尚无验证记录"},
+    ]
+    return requirement, [direct, portable], evidence
+
+
+def transfer_demo(workspace: str) -> dict[str, Any]:
+    root = Path(workspace)
+    root.mkdir(parents=True, exist_ok=True)
+    requirement, offers, evidence = transfer_demo_payloads()
+    with PortfolioService(root / "portfolio.sqlite3") as service:
+        service.import_requirement(requirement)
+        for offer in offers:
+            service.import_offer(offer)
+        for item in evidence:
+            service.import_evidence(item)
+        analysis = service.plan(requirement["key"])
+        report = analysis["report"]
+        return {"analysis_id": analysis["id"], "state": analysis["state"],
+                "feasible": report["feasible"], "selection": report["selection"],
+                "cost": report["cost"],
+                "verified_credited": report["verified_coverage"]["total_credited"],
+                "candidate_selection": report["candidate"]["selection"],
+                "candidate_cost": report["candidate"]["cost"],
+                "candidate_credited_with_pending": (
+                    report["candidate"]["coverage"]["total_candidate_credited"]
+                    if report["candidate"]["coverage"] else 0),
+                "targets": [{"slice": row["slice"], "required": row["required"],
+                             "validated_transfer_count": row["validated_transfer_count"],
+                             "pending_transfer_count": row["pending_transfer_count"]}
+                            for row in report["evidence_coverage"]],
+                "evidence": [{"key": item["key"], "status": item["status"], "usable": item["usable"]}
+                             for item in report["evidence"]["evidence"]]}
 
 
 def demo(workspace: str) -> dict[str, Any]:
@@ -126,6 +206,8 @@ def demo(workspace: str) -> dict[str, Any]:
 def execute(args: Namespace) -> Any:
     if args.command == "demo":
         return demo(args.workspace)
+    if args.command == "demo-transfer":
+        return transfer_demo(args.workspace)
     with PortfolioService(args.db) as service:
         if args.command == "import":
             return service.import_file(args.kind, args.file)
@@ -141,6 +223,10 @@ def execute(args: Namespace) -> Any:
             return service.verify(args.id)
         if args.command == "history":
             return service.history(args.requirement)
+        if args.command == "stale-drafts":
+            return service.stale_drafts(args.requirement)
+        if args.command == "replan":
+            return service.replan(args.analysis)
         if args.command == "versions":
             return service.document_history(args.kind, args.key)
         if args.command == "compare-versions":
@@ -161,6 +247,8 @@ def execute(args: Namespace) -> Any:
             return service.target_grid(args.requirement, args.slice, args.minimums)
         if args.command == "withdrawal":
             return service.withdrawal(args.requirement, args.package)
+        if args.command == "evidence-withdrawal":
+            return service.evidence_withdrawal(args.requirement, args.evidence)
         if args.command == "price-scenario":
             return service.price_scenario(args.requirement, args.package, args.unit_price)
         if args.command == "audit":

@@ -64,6 +64,19 @@ PATHS = {"teleoperation", "simulation", "portable", "internet"}
 OUTCOMES = {"success", "failure", "intervention"}
 PRICING = {"per_record", "per_hour", "flat"}
 LICENSES = {"nonexclusive", "single_customer", "restricted"}
+EVIDENCE_STATUSES = {"validated", "pending", "retracted"}
+EVIDENCE_STATUS_ALIASES = {"verified": "validated", "active": "validated",
+                           "provisional": "pending", "unverified": "pending",
+                           "withdrawn": "retracted", "revoked": "retracted"}
+TRANSFER_POLICIES = {"exact", "validated"}
+
+
+def normalize_evidence_status(value: Any) -> str | None:
+    """把已知状态写法归一化；未知值返回 None，供目录摘要使用。"""
+    if not isinstance(value, str):
+        return None
+    status = EVIDENCE_STATUS_ALIASES.get(value, value)
+    return status if status in EVIDENCE_STATUSES else None
 
 
 @dataclass(frozen=True)
@@ -105,6 +118,127 @@ class Observation:
 
     def document(self) -> dict[str, Any]:
         return {"slice": asdict(self.slice), "count": self.count, "episode_ids": list(self.episode_ids)}
+
+
+@dataclass(frozen=True)
+class EvidenceScope:
+    """已声明迁移证据覆盖的场景/阶段/结果，不含机型。
+
+    机型由证据条目的 source_robot 与 target_robot 给出，避免把一条验证记录
+    误用到未验证的机器人型号上。
+    """
+
+    scenario: str
+    stage: str
+    outcome: str
+
+    @classmethod
+    def parse(cls, value: Any) -> "EvidenceScope":
+        if not isinstance(value, dict):
+            raise PortfolioError("evidence_scope_shape", "evidence scope must be an object")
+        outcome = value.get("outcome")
+        if outcome not in OUTCOMES:
+            raise PortfolioError("outcome", "outcome must be success, failure or intervention")
+        return cls(key(value.get("scenario"), "scenario"), key(value.get("stage"), "stage"),
+                   outcome)
+
+    def token(self) -> str:
+        return "|".join((self.scenario, self.stage, self.outcome))
+
+    def document(self) -> dict[str, Any]:
+        return {"scenario": self.scenario, "stage": self.stage, "outcome": self.outcome}
+
+
+def _optional_text(value: Any, name: str, maximum: int) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str) or len(value) > maximum:
+        raise PortfolioError("invalid_text", f"{name} must contain at most {maximum} characters")
+    return value.strip()
+
+
+def _evidence_status(value: Any) -> str:
+    if not isinstance(value, str):
+        raise PortfolioError("evidence_status", "status must name validated, pending or retracted")
+    status = EVIDENCE_STATUS_ALIASES.get(value, value)
+    if status not in EVIDENCE_STATUSES:
+        raise PortfolioError("evidence_status", "status must name validated, pending or retracted")
+    return status
+
+
+def _evidence_scopes(value: Any) -> tuple[EvidenceScope, ...]:
+    if isinstance(value, dict):
+        raw = [value]
+    elif isinstance(value, list):
+        raw = value
+    else:
+        raise PortfolioError("evidence_scope", "evidence needs at least one declared scope")
+    scopes = tuple(EvidenceScope.parse(item) for item in raw)
+    if not scopes:
+        raise PortfolioError("evidence_scope", "evidence needs at least one declared scope")
+    if len({scope.token() for scope in scopes}) != len(scopes):
+        raise PortfolioError("duplicate_evidence_scope", "evidence repeats a scope")
+    return scopes
+
+
+@dataclass(frozen=True)
+class TransferEvidence:
+    """一条带版本的机器人迁移证据。
+
+    证据只声明“某包内由 source_robot 采集的某些场景样品可迁移到 target_robot”，
+    是否可用于必需覆盖由 status 决定：validated 计入已验证覆盖，pending 只作为
+    候选供给，retracted 不得使用。修订通过新的文档版本表达。
+    """
+
+    key: str
+    package: str
+    source_robot: str
+    target_robot: str
+    scopes: tuple[EvidenceScope, ...]
+    status: str
+    reference: str
+    validity: str
+    notes: str
+
+    @classmethod
+    def parse(cls, value: Any) -> "TransferEvidence":
+        if not isinstance(value, dict):
+            raise PortfolioError("evidence_shape", "evidence must be an object")
+        package = value.get("package")
+        source = value.get("source_robot", value.get("from_robot"))
+        target = value.get("target_robot", value.get("to_robot"))
+        source_robot = key(source, "source_robot")
+        target_robot = key(target, "target_robot")
+        if source_robot == target_robot:
+            raise PortfolioError("transfer_robots", "transfer evidence needs two distinct robots")
+        raw_scopes = value.get("scopes", value.get("scope", value.get("slices")))
+        if raw_scopes is None:
+            if any(name in value for name in ("scenario", "stage", "outcome")):
+                raw_scopes = {"scenario": value.get("scenario"), "stage": value.get("stage"),
+                              "outcome": value.get("outcome")}
+            else:
+                raise PortfolioError("evidence_scope", "evidence needs at least one declared scope")
+        scopes = _evidence_scopes(raw_scopes)
+        for scope in scopes:
+            if scope.outcome not in OUTCOMES:
+                raise PortfolioError("outcome", "outcome must be success, failure or intervention")
+        return cls(key(value.get("key"), "evidence key"), key(package, "package"),
+                   source_robot, target_robot, scopes,
+                   _evidence_status(value.get("status", "pending")),
+                   _optional_text(value.get("reference"), "reference", 160),
+                   _optional_text(value.get("validity", "indefinite"), "validity", 80),
+                   _optional_text(value.get("notes", ""), "notes", 500))
+
+    def covers(self, scenario: str, stage: str, outcome: str) -> bool:
+        return any(scope.scenario == scenario and scope.stage == stage and scope.outcome == outcome
+                   for scope in self.scopes)
+
+    def document(self) -> dict[str, Any]:
+        return {"key": self.key, "package": self.package, "source_robot": self.source_robot,
+                "target_robot": self.target_robot,
+                "scopes": [scope.document() for scope in self.scopes],
+                "status": self.status, "reference": self.reference,
+                "validity": self.validity, "notes": self.notes}
 
 
 @dataclass(frozen=True)
@@ -209,6 +343,7 @@ class Requirement:
     targets: tuple[Target, ...]
     allowed_paths: tuple[str, ...]
     maximum_packages: int
+    transfer_policy: str = "exact"
 
     @classmethod
     def parse(cls, value: Any) -> "Requirement":
@@ -226,19 +361,25 @@ class Requirement:
         if len(set(paths)) != len(paths):
             raise PortfolioError("allowed_paths", "duplicate collection path")
         maximum = count(value.get("maximum_packages", 12), "maximum_packages", minimum=1, maximum=24)
+        policy = value.get("transfer_policy", "exact")
+        if policy not in TRANSFER_POLICIES:
+            raise PortfolioError("transfer_policy", "transfer policy must be exact or validated")
         return cls(key(value.get("key"), "requirement key"), key(value.get("client"), "client"),
                    text(value.get("title"), "title"), str(decimal(value.get("budget"), "budget", nonnegative=True)),
-                   targets, tuple(paths), maximum)
+                   targets, tuple(paths), maximum, policy)
 
     def document(self) -> dict[str, Any]:
         return {"key": self.key, "client": self.client, "title": self.title,
                 "budget": self.budget, "targets": [item.document() for item in self.targets],
-                "allowed_paths": list(self.allowed_paths), "maximum_packages": self.maximum_packages}
+                "allowed_paths": list(self.allowed_paths), "maximum_packages": self.maximum_packages,
+                "transfer_policy": self.transfer_policy}
 
 
-def parse_document(kind: str, value: Any) -> Offer | Requirement:
+def parse_document(kind: str, value: Any) -> Offer | Requirement | TransferEvidence:
     if kind == "offer":
         return Offer.parse(value)
     if kind == "requirement":
         return Requirement.parse(value)
-    raise PortfolioError("document_kind", "kind must be offer or requirement")
+    if kind == "evidence":
+        return TransferEvidence.parse(value)
+    raise PortfolioError("document_kind", "kind must be offer, requirement or evidence")

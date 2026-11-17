@@ -4,8 +4,12 @@ from pathlib import Path
 from typing import Any
 import json
 
-from .contracts import Offer, Requirement, PortfolioError, parse_document
+from .contracts import (Offer, Requirement, TransferEvidence, PortfolioError,
+                        normalize_evidence_status, parse_document)
 from .ledger import Ledger
+
+
+KINDS = ("offer", "requirement", "evidence")
 
 
 def read_json(path: str | Path, *, limit: int = 4_000_000) -> dict[str, Any]:
@@ -21,6 +25,15 @@ def read_json(path: str | Path, *, limit: int = 4_000_000) -> dict[str, Any]:
     return value
 
 
+def _evidence_status_counts(evidence: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {"validated": 0, "pending": 0, "retracted": 0}
+    for doc in evidence:
+        status = normalize_evidence_status(doc["body"].get("status"))
+        if status is not None:
+            counts[status] += 1
+    return counts
+
+
 class Catalog:
     def __init__(self, ledger: Ledger):
         self.ledger = ledger
@@ -33,13 +46,19 @@ class Catalog:
         requirement = Requirement.parse(value)
         return self.ledger.insert_document("requirement", requirement.key, requirement.document())
 
+    def import_evidence(self, value: dict[str, Any]) -> dict[str, Any]:
+        evidence = TransferEvidence.parse(value)
+        return self.ledger.insert_document("evidence", evidence.key, evidence.document())
+
     def import_file(self, kind: str, path: str | Path) -> dict[str, Any]:
         value = read_json(path)
         if kind == "offer":
             return self.import_offer(value)
         if kind == "requirement":
             return self.import_requirement(value)
-        raise PortfolioError("document_kind", "kind must be offer or requirement")
+        if kind == "evidence":
+            return self.import_evidence(value)
+        raise PortfolioError("document_kind", "kind must be offer, requirement or evidence")
 
     def import_batch(self, value: dict[str, Any]) -> dict[str, Any]:
         """整批校验完成后才写入任何修订。"""
@@ -55,7 +74,12 @@ class Catalog:
             kind = item.get("kind")
             parsed = parse_document(kind, item["body"])
             document = parsed.document()
-            identity = parsed.package if isinstance(parsed, Offer) else parsed.key
+            if isinstance(parsed, Offer):
+                identity = parsed.package
+            elif isinstance(parsed, Requirement):
+                identity = parsed.key
+            else:
+                identity = parsed.key
             entries.append((kind, identity, document))
         imported = self.ledger.insert_documents(entries)
         return {"count": len(imported), "changed": sum(doc["changed"] for doc in imported),
@@ -69,23 +93,35 @@ class Catalog:
     def offers(self) -> list[tuple[dict[str, Any], Offer]]:
         return [(doc, Offer.parse(doc["body"])) for doc in self.ledger.documents("offer")]
 
+    def evidence(self) -> list[tuple[dict[str, Any], TransferEvidence]]:
+        return [(doc, TransferEvidence.parse(doc["body"])) for doc in self.ledger.latest_evidence()]
+
     def requirement(self, key: str) -> tuple[dict[str, Any], Requirement]:
         doc = self.ledger.latest_document("requirement", key)
         if not doc:
             raise PortfolioError("missing_requirement", f"requirement {key} not found")
         return doc, Requirement.parse(doc["body"])
 
+
     def history(self, kind: str, key: str) -> list[dict[str, Any]]:
-        if kind not in {"offer", "requirement"}:
+        if kind not in KINDS:
             raise PortfolioError("document_kind", "unknown document kind")
         return [doc for doc in self.ledger.documents(kind, latest=False) if doc["key"] == key]
 
     def summary(self) -> dict[str, Any]:
         offers = self.ledger.documents("offer")
         requirements = self.ledger.documents("requirement")
+        evidence = self.ledger.documents("evidence")
+        statuses = _evidence_status_counts(evidence)
         return {"offer_count": len(offers), "requirement_count": len(requirements),
+                "evidence_count": len(evidence),
+                "evidence_validated": statuses["validated"],
+                "evidence_pending": statuses["pending"],
+                "evidence_retracted": statuses["retracted"],
                 "offer_versions": sum(len(self.history("offer", item["key"])) for item in offers),
-                "requirement_versions": sum(len(self.history("requirement", item["key"])) for item in requirements)}
+                "requirement_versions": sum(len(self.history("requirement", item["key"]))
+                                            for item in requirements),
+                "evidence_versions": sum(len(self.history("evidence", item["key"])) for item in evidence)}
 
     def compare_versions(self, kind: str, key: str, earlier: int, later: int) -> dict[str, Any]:
         if earlier == later or earlier < 1 or later < 1:
@@ -111,6 +147,12 @@ class Catalog:
                 changes = [{"slice": token, "earlier": old.get(token), "later": new.get(token)}
                            for token in sorted(old.keys() | new.keys()) if old.get(token) != new.get(token)]
                 changed.append({"field": field, "target_changes": changes})
+            elif field == "scopes" and kind == "evidence":
+                old = {str(item): item for item in first[field] or []}
+                new = {str(item): item for item in second[field] or []}
+                changes = [{"scope": token, "earlier": old.get(token), "later": new.get(token)}
+                           for token in sorted(old.keys() | new.keys()) if old.get(token) != new.get(token)]
+                changed.append({"field": field, "scope_changes": changes})
             else:
                 changed.append({"field": field, "earlier": first.get(field),
                                 "later": second.get(field)})
